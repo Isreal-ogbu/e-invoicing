@@ -1,0 +1,7 @@
+spring:
+  application:
+    name: omnix-e-invoice
+  cloud:
+    config:
+      uri: ${CONFIG_SERVER_URI:http://localhost:2001}
+      name: config-server
