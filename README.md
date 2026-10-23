@@ -1,30 +1,88 @@
 # E-Invoice service
 
-Independent Spring Boot 2.3 / Java 11 service registered with Config Server and Eureka.
+Independent Spring Boot 2.3 / Java 11 microservice registered with Config Server and Eureka (`omnix-e-invoice`).
+
+It reads the daily T24 journal export, identifies included tax remittance credits, builds FIRS self-billed invoice payloads, stores them, optionally submits them, and exposes GET APIs to spool the saved invoices.
+
+## Journal source
+
+- UNC share: `\\192.168.1.39\t24 daily reports\JOURNAL`
+- Service reads the share over **SMB** with configured credentials (no OS mount required)
+- Config keys / env vars:
+  - `e-invoice.journal.smb-host` / `EINVOICE_SMB_HOST` (default `192.168.1.39`)
+  - `e-invoice.journal.smb-share` / `EINVOICE_SMB_SHARE` (default `t24 daily reports`)
+  - `e-invoice.journal.smb-path` / `EINVOICE_SMB_PATH` (default `JOURNAL`)
+  - `e-invoice.journal.smb-username` / `EINVOICE_SMB_USERNAME`
+  - `e-invoice.journal.smb-password` / `EINVOICE_SMB_PASSWORD`
+  - optional `EINVOICE_SMB_DOMAIN`
+- Resolution order: **SMB → local/mounted directory → classpath sample**
+
+
+## Included tax rules
+
+From *E-Invoicing integration remittance line.xlsx* (only rows marked included):
+
+| Kind | Account / category | Txn code | Rate | Invoice suffix |
+|------|--------------------|----------|------|----------------|
+| VAT corporate | category `16120` (`NGN16120...`) | `780` credit | 7.5% of matched charge (ROUND_UP to kobo) | `ORI` |
+| Stamp duty on loans | account `1103824527` | `258` credit | 0.125% | `LSD` |
+| Stamp duty on EMT | category `16048` | `158` credit | flat ₦50, transfer ≥ ₦10,000 | `TSD` |
+
+Matching logic (from the implementation transcript):
+
+1. Find **credit** tax legs on the included account/category + transaction code
+2. Group sibling journal rows by normalized FT (`OUR.REF` / `TRANS.REF`, strip trailing `BNK`)
+3. For VAT, find the related income/charge (usually code `790`) where `charge * 7.5%` rounds **up** to the VAT amount
+4. Build one invoice per tax credit (`FT…ORI`, `FT…LSD`, `FT…TSD`)
+
+## Sample payload shape
+
+Saved request payload matches the agreed FIRS structure, for example:
+
+- `invoiceNumber`: `FT2625981PS5ORI`
+- `invoiceTypeCode`: `Self-billed Invoice` (override with FIRS code via `EINVOICE_SELF_BILLED_CODE` when confirmed)
+- supplier = Accion MFB static party
+- customer = debit customer (T24 when available, journal name fallback)
+- `taxTotals` / `legalMonetaryTotal` / `invoiceLines` populated from the tax + taxable charge
 
 ## Endpoints
 
-- `GET /api/v1/e-invoices/spool?date=2026-09-16` reads and stores that day's journal rows, then returns the spooled entries. It is idempotent by journal date and source row.
-- `POST /api/v1/e-invoices/process?date=2026-09-16` runs the configured daily flow. Add `&ftReference=FT2625981PS5` to process only one FT for a controlled replay or investigation.
-- `GET /api/v1/e-invoices?date=2026-09-16` lists persisted invoice requests and their processing status.
+- `GET /api/v1/e-invoices/spool?date=2026-09-16`  
+  Read and persist that day's journal rows (idempotent).
 
-A scheduler runs the previous day's journal at `EINVOICE_SCHEDULE` (default 02:15 daily in `EINVOICE_TIME_ZONE`, default Africa/Lagos). The processor parses the headerless 24-column CSV, groups rows by `OUR.REF`, matches credit tax entries, pairs VAT with a related code 790 charge when the rounded 7.5% amount agrees, handles loan stamp duty separately, retrieves FT/customer details through TAFJ/OFS, builds the invoice structure from the supplied example, submits it, and stores request/response/status for retry and reconciliation. Multiple tax entries on one FT are combined into one invoice to preserve the FT invoice-number idempotency rule.
+- `POST /api/v1/e-invoices/process?date=2026-09-16`  
+  Build invoices for the day. Optional:
+  - `&ftReference=FT2625981PS5` process one FT only
+  - `&dryRun=true` build/save payloads without calling the FIRS API
 
-Included journal rules taken from the remittance workbook:
+- `GET /api/v1/e-invoices?date=2026-09-16`  
+  List saved invoices for the date. Returns metadata plus parsed `invoice` JSON body.  
+  Optional filters: `&status=BUILT` / `SUBMITTED` / `FAILED`, `&ftReference=FT…`
 
-- Corporate VAT: account prefix `NGN16120`, transaction code `780`, 7.5% of the matched charge.
-- Stamp duty on loans: account `1103824527`, transaction code `258`, 0.125%; original loan amount is taken from the FT enquiry and checked against the tax credit.
-- Stamp duty on transactions: account prefix `NGN16048`, transaction code `158`, flat ₦50, with the ₦10,000 threshold checked against the FT enquiry.
+- `GET /api/v1/e-invoices/{invoiceNumber}`  
+  Fetch one saved invoice, e.g. `/api/v1/e-invoices/FT2625981PS5ORI`
 
-## Required deployment configuration
+Scheduler: previous business day at `EINVOICE_SCHEDULE` (default `0 15 2 * * *` Africa/Lagos).
 
-- `EINVOICE_JOURNAL_DIRECTORY`: directory readable by the service. Default filename pattern is `JOURNAL_{date}.csv`, where `{date}` formats as `dd_MMM_yyyy` in uppercase, producing `JOURNAL_16_SEP_2026.csv` for 16 September 2026.
-- `TAFJ_URL`, `TAFJ_HTTP_USERNAME`, `TAFJ_HTTP_PASSWORD`: TAFJ HTTP endpoint settings. `TAFJ_USERNAME` and `TAFJ_PASSWORD` are the OFS user credentials placed inside the OFS request. Credentials are not embedded in the service.
-- `EINVOICE_API_URL`, `EINVOICE_API_TOKEN`: invoice submission endpoint and bearer token.
-- `EINVOICE_SELF_BILLED_CODE`: FIRS code for Self-billed Invoice.
-- `EINVOICE_DB_URL`, `EINVOICE_DB_USERNAME`, `EINVOICE_DB_PASSWORD`: database connection. Development uses MySQL with Hibernate `ddl-auto: update`; production should use the organization's migration policy.
-- `EINVOICE_JOURNAL_DIRECTORY` and `EINVOICE_SCHEDULE` can also be moved to the Config Server repository for environment-specific values.
+## Configuration
 
-The exact FIRS submission URL/authentication/response contract and Self-billed Invoice code were not present in the attached files, so those are explicit configuration gates. The code uses the supplied sample invoice JSON structure and persists the submission response. The customer detail mapping uses T24 OFS fields available from the existing core model; fields absent from the response are left empty.
+| Variable | Purpose |
+|----------|---------|
+| `EINVOICE_JOURNAL_DIRECTORY` | Mounted journal folder |
+| `TAFJ_URL`, `TAFJ_HTTP_USERNAME`, `TAFJ_HTTP_PASSWORD` | TAFJ HTTP endpoint |
+| `TAFJ_USERNAME`, `TAFJ_PASSWORD` | OFS user inside the request body |
+| `EINVOICE_API_URL`, `EINVOICE_API_TOKEN` | FIRS/submit endpoint |
+| `EINVOICE_SELF_BILLED_CODE` | Invoice type code/description |
+| `EINVOICE_SUBMIT_ENABLED` | `false` to only build/store |
+| `EINVOICE_T24_ENABLED` | `false` to skip OFS enrichment (local dry run) |
+| `EINVOICE_DB_*` | MySQL connection |
+| `CONFIG_SERVER_URI` / `EUREKA_URI` | Shared platform config + discovery |
 
-The share permission for host `192.168.1.52` cannot be granted from this repository. Operations must grant the host access to `\\192.168.1.39\t24 daily reports\JOURNAL` and mount it into the service environment. On Linux, set `EINVOICE_JOURNAL_DIRECTORY` to that mount path.
+## Local dry-run example
+
+```bash
+# with sample journal on classpath or mounted directory
+curl -X POST 'http://localhost:2010/api/v1/e-invoices/process?date=2026-09-16&ftReference=FT2625981PS5&dryRun=true'
+curl 'http://localhost:2010/api/v1/e-invoices?date=2026-09-16&ftReference=FT2625981PS5'
+curl 'http://localhost:2010/api/v1/e-invoices/FT2625981PS5ORI'
+```

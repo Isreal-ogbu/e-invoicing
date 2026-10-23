@@ -5,7 +5,7 @@ import com.accionmfb.omnix.einvoice.client.T24EnquiryClient;
 import com.accionmfb.omnix.einvoice.config.EInvoiceProperties;
 import com.accionmfb.omnix.einvoice.invoice.EInvoiceDocument;
 import com.accionmfb.omnix.einvoice.invoice.EInvoiceDocumentRepository;
-import com.accionmfb.omnix.einvoice.journal.JournalSpoolRecord;
+import com.accionmfb.omnix.einvoice.journal.JournalRow;
 import com.accionmfb.omnix.einvoice.journal.JournalSpoolService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
@@ -16,14 +16,14 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -33,8 +33,10 @@ import java.util.logging.Logger;
 @Service
 public class EInvoiceWorkflowService {
     private static final Logger LOG = Logger.getLogger(EInvoiceWorkflowService.class.getName());
-    private static final int CUSTOMER = 0, ACCOUNT = 1, ACCOUNT_NAME = 2, CREDIT = 4, DEBIT = 5,
-            TXN_CODE = 6, TRANS_REF = 11, OUR_REF = 12, NARRATION = 22;
+    private static final BigDecimal STAMP_THRESHOLD = new BigDecimal("10000");
+    private static final DateTimeFormatter ISSUE_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+
     private final JournalSpoolService spool;
     private final EInvoiceDocumentRepository invoices;
     private final T24EnquiryClient t24;
@@ -45,216 +47,458 @@ public class EInvoiceWorkflowService {
     public EInvoiceWorkflowService(JournalSpoolService spool, EInvoiceDocumentRepository invoices,
                                    T24EnquiryClient t24, EInvoiceApiClient api,
                                    EInvoiceProperties properties, ObjectMapper mapper) {
-        this.spool = spool; this.invoices = invoices; this.t24 = t24; this.api = api;
-        this.properties = properties; this.mapper = mapper;
+        this.spool = spool;
+        this.invoices = invoices;
+        this.t24 = t24;
+        this.api = api;
+        this.properties = properties;
+        this.mapper = mapper;
     }
 
     public RunResult run(LocalDate date) throws IOException {
-        return run(date, null);
+        return run(date, null, false);
     }
 
     public RunResult run(LocalDate date, String ftReferenceFilter) throws IOException {
-        List<JournalSpoolRecord> records = spool.spool(date);
-        Map<String, List<Row>> groups = new HashMap<>();
-        for (JournalSpoolRecord record : records) {
-            Row row = Row.from(record.getRawRecord());
-            if (row == null || row.groupReference().isEmpty()) continue;
-            groups.computeIfAbsent(row.groupReference(), ignored -> new ArrayList<>()).add(row);
+        return run(date, ftReferenceFilter, false);
+    }
+
+    /**
+     * @param dryRun when true, build and persist invoice payloads without calling the FIRS API
+     */
+    @Transactional
+    public RunResult run(LocalDate date, String ftReferenceFilter, boolean dryRun) throws IOException {
+        List<JournalRow> rows = spool.loadRows(date);
+        Map<String, List<JournalRow>> groups = new LinkedHashMap<>();
+        for (JournalRow row : rows) {
+            String groupKey = row.groupReference();
+            if (groupKey.isEmpty()) continue;
+            groups.computeIfAbsent(groupKey, ignored -> new ArrayList<>()).add(row);
         }
+
         if (ftReferenceFilter != null && !ftReferenceFilter.trim().isEmpty()) {
-            String requested = ftReferenceFilter.trim();
-            groups.entrySet().removeIf(entry -> !entry.getKey().equalsIgnoreCase(requested)
-                    && entry.getValue().stream().noneMatch(row -> row.invoiceReference().equalsIgnoreCase(requested)));
+            String requested = JournalRow.normalizeReference(ftReferenceFilter.trim());
+            groups.entrySet().removeIf(entry -> !entry.getKey().equalsIgnoreCase(requested));
         }
-        int candidates = 0, submitted = 0, failed = 0, skipped = 0;
-        for (Map.Entry<String, List<Row>> group : groups.entrySet()) {
-            Map<String, List<Row>> invoiceTaxes = new HashMap<>();
-            Map<String, List<TaxRule>> invoiceRules = new HashMap<>();
-            for (Row row : group.getValue()) {
-                TaxRule rule = TaxRule.match(row);
-                if (rule != null) {
-                    String invoiceNumber = row.invoiceReference().isEmpty() ? group.getKey() + "ORI" : row.invoiceReference();
-                    invoiceTaxes.computeIfAbsent(invoiceNumber, ignored -> new ArrayList<>()).add(row);
-                    invoiceRules.computeIfAbsent(invoiceNumber, ignored -> new ArrayList<>()).add(rule);
-                }
-            }
-            for (Map.Entry<String, List<Row>> invoiceGroup : invoiceTaxes.entrySet()) {
-                List<Row> taxes = invoiceGroup.getValue();
-                List<TaxRule> rules = invoiceRules.get(invoiceGroup.getKey());
-                candidates += taxes.size();
-                String invoiceNumber = invoiceGroup.getKey();
-                String taxLabel = rules.size() == 1 ? rules.get(0).kind : "MULTIPLE";
+
+        int candidates = 0, built = 0, submitted = 0, failed = 0, skipped = 0;
+        for (Map.Entry<String, List<JournalRow>> group : groups.entrySet()) {
+            String ftReference = group.getKey();
+            List<JournalRow> related = group.getValue();
+            for (JournalRow taxRow : related) {
+                TaxRule rule = TaxRule.match(taxRow);
+                if (rule == null) continue;
+                candidates++;
+                String invoiceNumber = rule.invoiceNumber(ftReference);
                 Optional<EInvoiceDocument> existing = invoices.findByInvoiceNumber(invoiceNumber);
-                if (existing.isPresent() && "SUBMITTED".equals(existing.get().getStatus())) { skipped++; continue; }
-                EInvoiceDocument document;
-                if (existing.isPresent()) document = existing.get();
-                else document = invoices.save(new EInvoiceDocument(invoiceNumber, group.getKey(), date, taxLabel));
+                if (existing.isPresent() && "SUBMITTED".equals(existing.get().getStatus())) {
+                    skipped++;
+                    continue;
+                }
+                EInvoiceDocument document = existing.orElseGet(() ->
+                        invoices.save(new EInvoiceDocument(invoiceNumber, ftReference, date, rule.kind)));
                 try {
-                    Map<String, Object> payload = buildPayload(taxes, rules, group.getValue(), group.getKey(), invoiceNumber);
-                    String serialized = mapper.writeValueAsString(payload);
+                    Map<String, Object> payload = buildPayload(taxRow, rule, related, ftReference, invoiceNumber, date);
+                    String serialized = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(payload);
                     document.setRequestPayload(serialized);
-                    document.setStatus("PENDING");
-                    invoices.save(document);
-                    String response = api.submit(serialized);
-                    document.setResponsePayload(response);
+                    document.setTaxAmount(taxRow.credit().toPlainString());
+                    document.setTaxableAmount(String.valueOf(payload.get("legalMonetaryTotal") instanceof Map
+                            ? ((Map<?, ?>) payload.get("legalMonetaryTotal")).get("taxExclusiveAmount")
+                            : ""));
+                    document.setCustomerName(extractCustomerName(payload));
                     document.setLastError(null);
-                    document.setStatus("SUBMITTED");
-                    invoices.save(document);
-                    submitted++;
+
+                    boolean shouldSubmit = !dryRun && properties.isSubmitEnabled()
+                            && properties.getInvoiceApiUrl() != null
+                            && !properties.getInvoiceApiUrl().trim().isEmpty();
+                    if (shouldSubmit) {
+                        document.setStatus("PENDING");
+                        invoices.save(document);
+                        String response = api.submit(serialized);
+                        document.setResponsePayload(response);
+                        document.setStatus("SUBMITTED");
+                        invoices.save(document);
+                        submitted++;
+                    } else {
+                        document.setStatus(dryRun ? "DRY_RUN" : "BUILT");
+                        document.setResponsePayload(null);
+                        invoices.save(document);
+                        built++;
+                    }
                 } catch (Exception e) {
                     document.setStatus("FAILED");
                     document.setLastError(truncate(e.getMessage(), 1900));
                     invoices.save(document);
                     failed++;
-                    LOG.log(Level.WARNING, "E-invoice processing failed for FT {0}: {1}", new Object[]{group.getKey(), e.getMessage()});
+                    LOG.log(Level.WARNING, "E-invoice processing failed for {0}: {1}",
+                            new Object[]{invoiceNumber, e.getMessage()});
                 }
             }
         }
-        RunResult result = new RunResult(date, records.size(), candidates, submitted, failed, skipped);
-        LOG.log(Level.INFO, "E-invoice run date={0}, journalRows={1}, candidateTaxes={2}, submitted={3}, failed={4}, skipped={5}",
-                new Object[]{date, records.size(), candidates, submitted, failed, skipped});
+        RunResult result = new RunResult(date, rows.size(), candidates, built, submitted, failed, skipped);
+        LOG.log(Level.INFO,
+                "E-invoice run date={0}, journalRows={1}, candidates={2}, built={3}, submitted={4}, failed={5}, skipped={6}",
+                new Object[]{date, rows.size(), candidates, built, submitted, failed, skipped});
         return result;
     }
 
-    @Transactional
-    protected Map<String, Object> buildPayload(List<Row> taxes, List<TaxRule> rules, List<Row> related, String ftReference, String invoiceNumber) {
-        if (isBlank(properties.getInvoiceTypeCode())) throw new IllegalStateException("Configure the Self-billed Invoice type code from the FIRS lookup");
-        Map<String, String> transaction = t24.transaction(ftReference);
-        String customerNumber = val(transaction, "DEBIT.CUSTOMER:1:1");
-        if (customerNumber.isEmpty()) customerNumber = related.stream().map(r -> r.value(CUSTOMER)).filter(v -> !v.isEmpty()).findFirst().orElse("");
-        if (customerNumber.isEmpty()) throw new IllegalStateException("Debit customer number not found for FT " + ftReference);
-        Map<String, String> customer = t24.customer(customerNumber);
-        BigDecimal totalTax = BigDecimal.ZERO, totalTaxable = BigDecimal.ZERO;
-        List<Map<String, Object>> taxTotals = new ArrayList<>(), invoiceLines = new ArrayList<>();
-        for (int i = 0; i < taxes.size(); i++) {
-            Row tax = taxes.get(i); TaxRule rule = rules.get(i);
-            BigDecimal taxAmount = money(tax.value(CREDIT));
-            BigDecimal taxableAmount = determineTaxableAmount(tax, rule, related, transaction, taxAmount);
-            totalTax = totalTax.add(taxAmount); totalTaxable = totalTaxable.add(taxableAmount);
-            Map<String, Object> taxCategory = map("id", rule.taxCategory, "percent", rule.percent);
-            Map<String, Object> subtotal = map("taxableAmount", taxableAmount, "taxAmount", taxAmount, "taxCategory", taxCategory);
-            taxTotals.add(map("taxAmount", taxAmount, "taxSubtotal", Collections.singletonList(subtotal)));
-            Row charge = related.stream().filter(r -> r.code().equals("790") && hasAmount(r))
-                    .filter(r -> rule.kind.equals("VAT") && money(r.value(CREDIT)).add(money(r.value(DEBIT))).multiply(rule.rate)
-                            .setScale(2, RoundingMode.HALF_UP).compareTo(taxAmount) == 0).findFirst().orElse(tax);
-            String itemName = firstNonEmpty(tax.value(ACCOUNT_NAME), "TAX CHARGE");
-            String description = firstNonEmpty(charge.value(NARRATION), tax.value(NARRATION), itemName);
-            Map<String, Object> lineItem = map("name", itemName, "description", description, "sellersItemIdentification", tax.value(ACCOUNT));
-            Map<String, Object> price = map("priceAmount", taxableAmount, "baseQuantity", 1, "priceUnit", taxableAmount.toPlainString());
-            invoiceLines.add(map("hsnCode", "", "discountRate", BigDecimal.ZERO, "discountAmount", BigDecimal.ZERO,
-                    "feeRate", BigDecimal.ZERO, "feeAmount", BigDecimal.ZERO, "invoicedQuantity", 1,
-                    "lineExtensionAmount", BigDecimal.ZERO, "item", lineItem, "price", price));
+    public Map<String, Object> buildPayload(JournalRow taxRow, TaxRule rule, List<JournalRow> related,
+                                     String ftReference, String invoiceNumber, LocalDate journalDate) {
+        if (isBlank(properties.getInvoiceTypeCode())) {
+            throw new IllegalStateException("Configure e-invoice.journal.invoice-type-code (Self-billed Invoice)");
         }
-        BigDecimal inclusive = totalTaxable.add(totalTax).setScale(2, RoundingMode.HALF_UP);
-        Row primaryTax = taxes.get(0);
-        String issueDate = issueDate(val(transaction, "DATE.TIME:1:1"));
-        String issueTime = issueDate.substring(11, 19);
-        String customerName = firstNonEmpty(val(customer, "SHORT.NAME:1:1"), val(customer, "NAME.1:1:1"), val(customer, "MNEMONIC:1:1"));
-        String address = firstNonEmpty(val(customer, "STREET:1:1"), val(customer, "ADDRESS:1:1"));
-        Map<String, Object> supplier = party(properties.getSupplierName(), properties.getSupplierTin(), true,
-                properties.getSupplierEmail(), properties.getSupplierTelephone(), properties.getSupplierBusinessDescription(),
-                properties.getSupplierStreet(), properties.getSupplierCity(), "", properties.getSupplierCountry());
+
+        Map<String, String> transaction = enquireTransaction(ftReference);
+        String customerNumber = firstNonEmpty(
+                val(transaction, "DEBIT.CUSTOMER:1:1"),
+                val(transaction, "DEBIT.CUSTOMER"),
+                related.stream().map(JournalRow::customerId).filter(v -> !v.isEmpty()).findFirst().orElse(""));
+        Map<String, String> customer = enquireCustomer(customerNumber);
+
+        BigDecimal taxAmount = taxRow.credit().setScale(2, RoundingMode.HALF_UP);
+        ChargeMatch charge = determineTaxableAmount(taxRow, rule, related, transaction, taxAmount);
+        BigDecimal taxableAmount = charge.amount.setScale(2, RoundingMode.HALF_UP);
+        BigDecimal inclusive = taxableAmount.add(taxAmount).setScale(2, RoundingMode.HALF_UP);
+
+        String issueDate = resolveIssueDate(val(transaction, "DATE.TIME:1:1"), val(transaction, "DATE.TIME"), journalDate);
+        String issueTime = issueDate.length() >= 19 ? issueDate.substring(11, 19) : "00:00:00";
+
+        Map<String, Object> supplier = party(
+                properties.getSupplierName(),
+                properties.getSupplierTin(),
+                true,
+                properties.getSupplierEmail(),
+                properties.getSupplierTelephone(),
+                properties.getSupplierBusinessDescription(),
+                properties.getSupplierStreet(),
+                properties.getSupplierCity(),
+                "",
+                properties.getSupplierCountry()
+        );
+
+        String customerName = firstNonEmpty(
+                val(customer, "SHORT.NAME:1:1"),
+                val(customer, "NAME.1:1:1"),
+                val(customer, "MNEMONIC:1:1"),
+                related.stream().map(JournalRow::accountName)
+                        .filter(name -> name != null && !name.isEmpty() && !name.startsWith("VAT")
+                                && !name.startsWith("STAMP") && !name.startsWith("ACC PAY")
+                                && !name.startsWith("RECORD."))
+                        .findFirst().orElse(""),
+                customerNumber
+        );
         String customerTin = firstNonEmpty(val(customer, "TIN:1:1"), val(customer, "TAX.IDENTIFICATION.NO:1:1"));
-        Map<String, Object> buyer = party(customerName, customerTin, false,
-                firstNonEmpty(val(customer, "EMAIL.1:1:1"), val(customer, "E.MAIL.ADDRESS:1:1")),
-                val(customer, "TEL.MOBILE:1:1"), "", address,
-                firstNonEmpty(val(customer, "CUS.BUS.CITY:1:1"), "LAGOS"), "", firstNonEmpty(val(customer, "NATIONALITY:1:1"), "NIG"));
-        Map<String, Object> totals = map("lineExtensionAmount", BigDecimal.ZERO, "taxExclusiveAmount", totalTaxable,
-                "taxInclusiveAmount", inclusive, "payableAmount", totalTax);
-        Map<String, Object> result = map("invoiceNumber", invoiceNumber, "issueDate", issueDate, "dueDate", issueDate,
-                "issueTime", issueTime, "invoiceTypeCode", properties.getInvoiceTypeCode(), "paymentStatus", "COMPLETED",
-                "documentCurrencyCode", "NGN", "taxCurrencyCode", "NGN", "accountingSupplierParty", supplier,
-                "accountingCustomerParty", buyer, "taxTotals", taxTotals,
-                "legalMonetaryTotal", totals, "invoiceLines", invoiceLines);
-        if (!primaryTax.value(NARRATION).isEmpty()) result.put("note", primaryTax.value(NARRATION));
+        String customerEmail = firstNonEmpty(val(customer, "EMAIL.1:1:1"), val(customer, "E.MAIL.ADDRESS:1:1"));
+        String customerPhone = firstNonEmpty(val(customer, "TEL.MOBILE:1:1"), val(customer, "SMS.1:1:1"),
+                val(customer, "PHONE.1:1:1"));
+        String street = firstNonEmpty(val(customer, "STREET:1:1"), val(customer, "ADDRESS:1:1"),
+                val(customer, "TOWN.COUNTRY:1:1"));
+        String city = firstNonEmpty(val(customer, "CUS.BUS.CITY:1:1"), val(customer, "TOWN.COUNTRY:1:1"), "LAGOS");
+        String country = firstNonEmpty(val(customer, "NATIONALITY:1:1"), val(customer, "COUNTRY:1:1"), "NIG");
+
+        Map<String, Object> buyer = party(
+                customerName,
+                customerTin,
+                !customerTin.isEmpty(),
+                customerEmail,
+                customerPhone,
+                firstNonEmpty(val(customer, "INDUSTRY:1:1"), val(customer, "SECTOR:1:1"), ""),
+                street,
+                city,
+                "",
+                country
+        );
+
+        Map<String, Object> taxCategory = map("id", rule.taxCategoryId, "percent", rule.percent);
+        Map<String, Object> subtotal = map(
+                "taxableAmount", taxableAmount,
+                "taxAmount", taxAmount,
+                "taxCategory", taxCategory
+        );
+        List<Map<String, Object>> taxTotals = Collections.singletonList(
+                map("taxAmount", taxAmount, "taxSubtotal", Collections.singletonList(subtotal))
+        );
+
+        String itemName = firstNonEmpty(taxRow.accountName(), rule.defaultItemName);
+        String description = firstNonEmpty(charge.narration, taxRow.narration(), itemName);
+        Map<String, Object> lineItem = map(
+                "name", itemName,
+                "description", description,
+                "sellersItemIdentification", firstNonEmpty(taxRow.account(), "")
+        );
+        Map<String, Object> price = map(
+                "priceAmount", taxableAmount,
+                "baseQuantity", 1,
+                "priceUnit", taxableAmount.toPlainString()
+        );
+        Map<String, Object> invoiceLine = map(
+                "hsnCode", "",
+                "discountRate", BigDecimal.ZERO,
+                "discountAmount", BigDecimal.ZERO,
+                "feeRate", BigDecimal.ZERO,
+                "feeAmount", BigDecimal.ZERO,
+                "invoicedQuantity", 1,
+                "lineExtensionAmount", BigDecimal.ZERO,
+                "item", lineItem,
+                "price", price
+        );
+
+        Map<String, Object> totals = map(
+                "lineExtensionAmount", BigDecimal.ZERO,
+                "taxExclusiveAmount", taxableAmount,
+                "taxInclusiveAmount", inclusive,
+                "payableAmount", taxAmount
+        );
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("invoiceNumber", invoiceNumber);
+        result.put("issueDate", issueDate);
+        result.put("dueDate", issueDate);
+        result.put("issueTime", issueTime);
+        result.put("invoiceTypeCode", properties.getInvoiceTypeCode());
+        result.put("paymentStatus", "COMPLETED");
+        result.put("documentCurrencyCode", "NGN");
+        result.put("taxCurrencyCode", "NGN");
+        result.put("accountingSupplierParty", supplier);
+        result.put("accountingCustomerParty", buyer);
+        result.put("taxTotals", taxTotals);
+        result.put("legalMonetaryTotal", totals);
+        result.put("invoiceLines", Collections.singletonList(invoiceLine));
+        if (!taxRow.narration().isEmpty()) {
+            result.put("note", taxRow.narration());
+        }
         return result;
     }
 
-    private BigDecimal determineTaxableAmount(Row tax, TaxRule rule, List<Row> related,
-                                              Map<String, String> transaction, BigDecimal taxAmount) {
-        if (rule.kind.equals("VAT")) {
-            return related.stream().filter(r -> r.code().equals("790") && hasAmount(r))
-                    .map(r -> money(r.value(CREDIT)).add(money(r.value(DEBIT))))
-                    .filter(amount -> amount.multiply(rule.rate).setScale(2, RoundingMode.HALF_UP).compareTo(taxAmount) == 0)
-                    .findFirst().orElseThrow(() -> new IllegalStateException("Could not match VAT credit to a related charge"));
-        }
-        if (rule.kind.equals("LOAN_STAMP")) {
-            BigDecimal original = money(val(transaction, "DEBIT.AMOUNT:1:1"));
-            if (original.signum() > 0) {
-                if (original.multiply(rule.rate).setScale(2, RoundingMode.HALF_UP).compareTo(taxAmount) != 0)
-                    throw new IllegalStateException("Loan stamp amount does not reconcile to the original transaction amount");
-                return original;
+    private ChargeMatch determineTaxableAmount(JournalRow taxRow, TaxRule rule, List<JournalRow> related,
+                                               Map<String, String> transaction, BigDecimal taxAmount) {
+        if ("VAT".equals(rule.kind)) {
+            // Prefer income/charge legs (790) where amount * 7.5% rounds UP to the VAT credit.
+            Optional<JournalRow> matched = related.stream()
+                    .filter(r -> "790".equals(r.transactionCode()) && r.hasAmount())
+                    .filter(r -> vatRoundsTo(r.amount(), rule.rate, taxAmount))
+                    .findFirst();
+            if (!matched.isPresent()) {
+                matched = related.stream()
+                        .filter(r -> r.hasAmount())
+                        .filter(r -> !r.transactionCode().equals(taxRow.transactionCode()) || r.credit().compareTo(taxAmount) != 0)
+                        .filter(r -> !r.account().equals(taxRow.account()))
+                        .filter(r -> vatRoundsTo(r.amount(), rule.rate, taxAmount))
+                        .findFirst();
             }
-            throw new IllegalStateException("Original loan amount is missing from the transaction enquiry");
+            if (matched.isPresent()) {
+                JournalRow charge = matched.get();
+                return new ChargeMatch(charge.amount(), firstNonEmpty(charge.narration(), taxRow.narration()));
+            }
+            BigDecimal derived = deriveTaxableFromRate(taxAmount, rule.rate);
+            if (derived != null) {
+                return new ChargeMatch(derived, taxRow.narration());
+            }
+            throw new IllegalStateException("Could not match VAT credit " + taxAmount + " to a related charge for FT "
+                    + taxRow.groupReference());
         }
-        BigDecimal original = money(val(transaction, "DEBIT.AMOUNT:1:1"));
-        if (original.compareTo(new BigDecimal("10000")) < 0)
+
+        if ("LOAN_STAMP".equals(rule.kind)) {
+            BigDecimal original = firstPositive(
+                    money(val(transaction, "DEBIT.AMOUNT:1:1")),
+                    money(val(transaction, "DEBIT.AMOUNT")),
+                    money(val(transaction, "AMOUNT:1:1")),
+                    related.stream()
+                            .filter(r -> "213".equals(r.transactionCode()) && r.debit().signum() > 0)
+                            .map(JournalRow::debit)
+                            .findFirst().orElse(BigDecimal.ZERO)
+            );
+            if (original.signum() > 0) {
+                BigDecimal expected = original.multiply(rule.rate).setScale(2, RoundingMode.HALF_UP);
+                if (expected.compareTo(taxAmount) != 0) {
+                    BigDecimal derived = taxAmount.divide(rule.rate, 2, RoundingMode.HALF_UP);
+                    return new ChargeMatch(derived, taxRow.narration());
+                }
+                return new ChargeMatch(original, taxRow.narration());
+            }
+            BigDecimal derived = taxAmount.divide(rule.rate, 2, RoundingMode.HALF_UP);
+            return new ChargeMatch(derived, taxRow.narration());
+        }
+
+        // TRANSACTION_STAMP: flat N50 for transfers >= 10,000
+        BigDecimal original = firstPositive(
+                money(val(transaction, "DEBIT.AMOUNT:1:1")),
+                money(val(transaction, "DEBIT.AMOUNT")),
+                related.stream()
+                        .filter(r -> r.debit().compareTo(STAMP_THRESHOLD) >= 0)
+                        .map(JournalRow::debit)
+                        .findFirst().orElse(BigDecimal.ZERO),
+                related.stream()
+                        .filter(r -> r.credit().compareTo(STAMP_THRESHOLD) >= 0)
+                        .map(JournalRow::credit)
+                        .findFirst().orElse(BigDecimal.ZERO)
+        );
+        if (original.signum() > 0 && original.compareTo(STAMP_THRESHOLD) < 0) {
             throw new IllegalStateException("Stamp duty transaction is below the configured NGN 10,000 threshold");
-        return original;
+        }
+        if (original.signum() <= 0) {
+            original = STAMP_THRESHOLD;
+        }
+        return new ChargeMatch(original, taxRow.narration());
+    }
+
+    private static boolean vatRoundsTo(BigDecimal charge, BigDecimal rate, BigDecimal taxAmount) {
+        if (charge == null || charge.signum() <= 0) return false;
+        BigDecimal calculated = charge.multiply(rate).setScale(2, RoundingMode.UP);
+        return calculated.compareTo(taxAmount) == 0;
+    }
+
+    private static BigDecimal deriveTaxableFromRate(BigDecimal taxAmount, BigDecimal rate) {
+        if (rate == null || rate.signum() <= 0) return null;
+        BigDecimal derived = taxAmount.divide(rate, 4, RoundingMode.HALF_UP);
+        if (vatRoundsTo(derived, rate, taxAmount)) {
+            return derived.setScale(2, RoundingMode.HALF_UP);
+        }
+        // Try a two-decimal candidate around the division result.
+        BigDecimal scaled = derived.setScale(2, RoundingMode.HALF_UP);
+        if (vatRoundsTo(scaled, rate, taxAmount)) return scaled;
+        BigDecimal up = derived.setScale(2, RoundingMode.UP);
+        if (vatRoundsTo(up, rate, taxAmount)) return up;
+        return scaled;
+    }
+
+    private Map<String, String> enquireTransaction(String ftReference) {
+        if (!properties.isT24EnrichmentEnabled()) return Collections.emptyMap();
+        try {
+            return t24.transaction(ftReference);
+        } catch (Exception ex) {
+            LOG.log(Level.INFO, "T24 FT enquiry unavailable for {0}: {1}", new Object[]{ftReference, ex.getMessage()});
+            return Collections.emptyMap();
+        }
+    }
+
+    private Map<String, String> enquireCustomer(String customerNumber) {
+        if (!properties.isT24EnrichmentEnabled() || isBlank(customerNumber)) return Collections.emptyMap();
+        try {
+            return t24.customer(customerNumber);
+        } catch (Exception ex) {
+            LOG.log(Level.INFO, "T24 customer enquiry unavailable for {0}: {1}", new Object[]{customerNumber, ex.getMessage()});
+            return Collections.emptyMap();
+        }
+    }
+
+    private static String resolveIssueDate(String primary, String secondary, LocalDate journalDate) {
+        for (String candidate : new String[]{primary, secondary}) {
+            if (isBlank(candidate)) continue;
+            try {
+                return OffsetDateTime.parse(candidate.trim())
+                        .withOffsetSameInstant(ZoneOffset.UTC)
+                        .format(ISSUE_FORMAT);
+            } catch (DateTimeParseException ignored) { }
+            try {
+                String normalized = candidate.replace("/", " ").trim();
+                String[] parts = normalized.split("\\s+");
+                if (parts.length >= 2 && parts[0].matches("\\d{8}")) {
+                    String time = parts[1].length() == 4 ? parts[1].substring(0, 2) + ":" + parts[1].substring(2) + ":00"
+                            : parts[1].length() == 5 ? parts[1] + ":00" : parts[1];
+                    if (time.matches("\\d{2}:\\d{2}")) time = time + ":00";
+                    LocalDateTime parsed = LocalDateTime.parse(parts[0] + "T" + time,
+                            DateTimeFormatter.ofPattern("yyyyMMdd'T'HH:mm:ss"));
+                    return parsed.atOffset(ZoneOffset.UTC).format(ISSUE_FORMAT);
+                }
+            } catch (Exception ignored) { }
+        }
+        LocalDateTime fallback = LocalDateTime.of(journalDate, LocalTime.of(0, 0, 0));
+        return fallback.atOffset(ZoneOffset.UTC).format(ISSUE_FORMAT);
     }
 
     private Map<String, Object> party(String name, String tin, boolean validated, String email, String telephone,
                                       String description, String street, String city, String postalZone, String country) {
-        return map("partyName", name, "tin", tin, "isTinValidated", validated,
-                "email", email, "telephone", telephone, "businessDescription", description,
-                "postalAddress", map("streetName", street, "cityName", city, "postalZone", postalZone, "country", country));
+        return map(
+                "partyName", nullToEmpty(name),
+                "tin", nullToEmpty(tin),
+                "isTinValidated", validated,
+                "email", nullToEmpty(email),
+                "telephone", nullToEmpty(telephone),
+                "businessDescription", nullToEmpty(description),
+                "postalAddress", map(
+                        "streetName", nullToEmpty(street),
+                        "cityName", nullToEmpty(city),
+                        "postalZone", nullToEmpty(postalZone),
+                        "country", nullToEmpty(country)
+                )
+        );
     }
 
-    private static String issueDate(String value) {
-        String candidate = value == null ? "" : value.trim();
-        try { return OffsetDateTime.parse(candidate).withOffsetSameInstant(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")); }
-        catch (DateTimeParseException ignored) { }
-        try {
-            String normalized = candidate.replace("/", " ").trim();
-            String[] parts = normalized.split("\\s+");
-            if (parts.length >= 2 && parts[0].matches("\\d{8}")) {
-                String time = parts[1].length() == 5 ? parts[1] + ":00" : parts[1];
-                LocalDateTime parsed = LocalDateTime.parse(parts[0] + "T" + time, DateTimeFormatter.ofPattern("yyyyMMdd'T'HH:mm:ss"));
-                return parsed.atOffset(ZoneOffset.UTC).format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"));
-            }
-        } catch (Exception ignored) { }
-        throw new IllegalStateException("Transaction enquiry did not return a usable DATE.TIME field");
-    }
-
-    private static boolean hasAmount(Row r) { return money(r.value(CREDIT)).signum() > 0 || money(r.value(DEBIT)).signum() > 0; }
-    private static BigDecimal money(String value) { try { return new BigDecimal(value.replace(",", "").trim()); } catch (Exception ignored) { return BigDecimal.ZERO; } }
-    private static String val(Map<String, String> values, String key) { return values.getOrDefault(key, "").trim(); }
-    private static String firstNonEmpty(String... values) { return Arrays.stream(values).filter(v -> v != null && !v.trim().isEmpty()).findFirst().orElse(""); }
-    private static String truncate(String value, int max) { if (value == null) return "Processing failed"; return value.length() <= max ? value : value.substring(0, max); }
-    private static boolean isBlank(String value) { return value == null || value.trim().isEmpty(); }
-    private static Map<String, Object> map(Object... pairs) { Map<String, Object> result = new HashMap<>(); for (int i = 0; i < pairs.length; i += 2) result.put((String) pairs[i], pairs[i + 1]); return result; }
-
-    private static class TaxRule {
-        final String kind, taxCategory; final BigDecimal rate, percent;
-        TaxRule(String kind, String taxCategory, String rate, String percent) { this.kind = kind; this.taxCategory = taxCategory; this.rate = new BigDecimal(rate); this.percent = new BigDecimal(percent); }
-        static TaxRule match(Row row) {
-            if (!row.isCredit()) return null;
-            if (row.code().equals("780") && row.value(ACCOUNT).startsWith("NGN16120")) return new TaxRule("VAT", "SERVICE_TAX", "0.075", "7.5");
-            if (row.code().equals("258") && row.value(ACCOUNT).equals("1103824527")) return new TaxRule("LOAN_STAMP", "SERVICE_TAX", "0.00125", "0.125");
-            if (row.code().equals("158") && row.value(ACCOUNT).startsWith("NGN16048")) return new TaxRule("TRANSACTION_STAMP", "SERVICE_TAX", "50", "0");
-            return null;
+    @SuppressWarnings("unchecked")
+    private static String extractCustomerName(Map<String, Object> payload) {
+        Object party = payload.get("accountingCustomerParty");
+        if (party instanceof Map) {
+            Object name = ((Map<String, Object>) party).get("partyName");
+            return name == null ? "" : String.valueOf(name);
         }
+        return "";
     }
 
-    private static class Row {
-        final List<String> columns;
-        Row(List<String> columns) { this.columns = columns; }
-        static Row from(String line) { List<String> cols = JournalSpoolService.parseCsvLine(line); return cols.size() >= 23 ? new Row(cols) : null; }
-        String value(int index) { return index < columns.size() ? columns.get(index).trim().replaceAll("^'", "") : ""; }
-        String code() { return value(TXN_CODE); }
-        String groupReference() { return firstNonEmpty(value(OUR_REF), value(TRANS_REF)); }
-        String invoiceReference() { return value(TRANS_REF); }
-        boolean isCredit() { return money(value(CREDIT)).signum() > 0 && money(value(DEBIT)).signum() == 0; }
+    private static BigDecimal firstPositive(BigDecimal... values) {
+        if (values == null) return BigDecimal.ZERO;
+        for (BigDecimal value : values) {
+            if (value != null && value.signum() > 0) return value;
+        }
+        return BigDecimal.ZERO;
+    }
+
+    private static BigDecimal money(String value) { return JournalRow.money(value); }
+    private static String val(Map<String, String> values, String key) {
+        if (values == null || key == null) return "";
+        return values.getOrDefault(key, "").trim();
+    }
+    private static String firstNonEmpty(String... values) { return JournalRow.firstNonEmpty(values); }
+    private static String truncate(String value, int max) {
+        if (value == null) return "Processing failed";
+        return value.length() <= max ? value : value.substring(0, max);
+    }
+    private static boolean isBlank(String value) { return value == null || value.trim().isEmpty(); }
+    private static String nullToEmpty(String value) { return value == null ? "" : value; }
+
+    private static Map<String, Object> map(Object... pairs) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        for (int i = 0; i < pairs.length; i += 2) {
+            result.put((String) pairs[i], pairs[i + 1]);
+        }
+        return result;
+    }
+
+    private static final class ChargeMatch {
+        final BigDecimal amount;
+        final String narration;
+        ChargeMatch(BigDecimal amount, String narration) {
+            this.amount = amount;
+            this.narration = narration == null ? "" : narration;
+        }
     }
 
     public static class RunResult {
-        private final LocalDate date; private final int journalRecords, candidateTaxes, submitted, failed, skipped;
-        RunResult(LocalDate date, int journalRecords, int candidateTaxes, int submitted, int failed, int skipped) {
-            this.date = date; this.journalRecords = journalRecords; this.candidateTaxes = candidateTaxes;
-            this.submitted = submitted; this.failed = failed; this.skipped = skipped;
+        private final LocalDate date;
+        private final int journalRecords;
+        private final int candidateTaxes;
+        private final int built;
+        private final int submitted;
+        private final int failed;
+        private final int skipped;
+
+        public RunResult(LocalDate date, int journalRecords, int candidateTaxes, int built,
+                         int submitted, int failed, int skipped) {
+            this.date = date;
+            this.journalRecords = journalRecords;
+            this.candidateTaxes = candidateTaxes;
+            this.built = built;
+            this.submitted = submitted;
+            this.failed = failed;
+            this.skipped = skipped;
         }
-        public LocalDate getDate() { return date; } public int getJournalRecords() { return journalRecords; }
-        public int getCandidateTaxes() { return candidateTaxes; } public int getSubmitted() { return submitted; }
-        public int getFailed() { return failed; } public int getSkipped() { return skipped; }
+
+        public LocalDate getDate() { return date; }
+        public int getJournalRecords() { return journalRecords; }
+        public int getCandidateTaxes() { return candidateTaxes; }
+        public int getBuilt() { return built; }
+        public int getSubmitted() { return submitted; }
+        public int getFailed() { return failed; }
+        public int getSkipped() { return skipped; }
     }
 }

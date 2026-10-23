@@ -3,5 +3,7 @@ spring:
     name: omnix-e-invoice
   cloud:
     config:
+      enabled: ${CONFIG_ENABLED:true}
       uri: ${CONFIG_SERVER_URI:http://localhost:2001}
       name: config-server
+      fail-fast: false

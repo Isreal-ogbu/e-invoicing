@@ -5,24 +5,27 @@ spring:
   application:
     name: omnix-e-invoice
   datasource:
-    url: ${EINVOICE_DB_URL:jdbc:mysql://localhost:3306/omnix_einvoice?useSSL=false&serverTimezone=UTC}
-    username: ${EINVOICE_DB_USERNAME:root}
-    password: ${EINVOICE_DB_PASSWORD:}
-    driver-class-name: ${EINVOICE_DB_DRIVER:com.mysql.cj.jdbc.Driver}
+    url: ${EINVOICE_DB_URL:jdbc:sqlserver://10.10.0.52;databaseName=omnixrebirth;encrypt=true;trustServerCertificate=true}
+    username: ${EINVOICE_DB_USERNAME:omnixservice}
+    password: ${EINVOICE_DB_PASSWORD:Ab123456}
+    driver-class-name: ${EINVOICE_DB_DRIVER:com.microsoft.sqlserver.jdbc.SQLServerDriver}
   jpa:
     hibernate:
       ddl-auto: update
     show-sql: false
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.MySQL5InnoDBDialect
+        dialect: org.hibernate.dialect.SQLServer2012Dialect
 
 eureka:
   client:
     service-url:
       defaultZone: ${EUREKA_URI:http://localhost:2000/eureka}
+    register-with-eureka: true
+    fetch-registry: true
   instance:
     prefer-ip-address: true
+    appname: omnix-e-invoice
 
 e-invoice:
   journal:
@@ -30,14 +33,23 @@ e-invoice:
     file-pattern: ${EINVOICE_JOURNAL_PATTERN:JOURNAL_{date}.csv}
     schedule: ${EINVOICE_SCHEDULE:0 15 2 * * *}
     zone: ${EINVOICE_TIME_ZONE:Africa/Lagos}
-    ofs-url: ${TAFJ_URL:}
-    ofs-username: ${TAFJ_USERNAME:}
-    ofs-password: ${TAFJ_PASSWORD:}
-    tafj-username: ${TAFJ_HTTP_USERNAME:}
-    tafj-password: ${TAFJ_HTTP_PASSWORD:}
+    smb-enabled: ${EINVOICE_SMB_ENABLED:true}
+    smb-host: ${EINVOICE_SMB_HOST:192.168.1.39}
+    smb-share: ${EINVOICE_SMB_SHARE:t24 daily reports}
+    smb-path: ${EINVOICE_SMB_PATH:JOURNAL}
+    smb-domain: ${EINVOICE_SMB_DOMAIN:}
+    smb-username: ${EINVOICE_SMB_USERNAME:samkoyqw}
+    smb-password: ${EINVOICE_SMB_PASSWORD:Gnosieeees12345679$}
+    ofs-url: ${TAFJ_URL:http://192.168.1.45:8080/TAFJRestServices/resources/ofs}
+    ofs-username: ${TAFJ_USERNAME:MOBUSER}
+    ofs-password: ${TAFJ_PASSWORD:Password123}
+    tafj-username: ${TAFJ_HTTP_USERNAME:tafj}
+    tafj-password: ${TAFJ_HTTP_PASSWORD:tafj}
     invoice-api-url: ${EINVOICE_API_URL:}
     invoice-api-token: ${EINVOICE_API_TOKEN:}
-    invoice-type-code: ${EINVOICE_SELF_BILLED_CODE:}
+    invoice-type-code: ${EINVOICE_SELF_BILLED_CODE:Self-billed Invoice}
+    submit-enabled: ${EINVOICE_SUBMIT_ENABLED:true}
+    t24-enrichment-enabled: ${EINVOICE_T24_ENABLED:true}
     supplier-name: ${EINVOICE_SUPPLIER_NAME:ACCION MFB}
     supplier-tin: ${EINVOICE_SUPPLIER_TIN:1441432424}
     supplier-email: ${EINVOICE_SUPPLIER_EMAIL:info@accionmfb.com}
